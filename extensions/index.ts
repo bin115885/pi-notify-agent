@@ -5,7 +5,6 @@ import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, TextContent } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 
-const APP_NAME = "Pi";
 const DEFAULT_MIN_NOTIFY_MS = 3000;
 const LINUX_SOUND_FILES = [
 	"/usr/share/sounds/freedesktop/stereo/complete.oga",
@@ -23,13 +22,30 @@ function psQuote(value: string): string {
 	return value.replace(/'/g, "''");
 }
 
+function xmlEscape(value: string): string {
+	return value
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;");
+}
+
 function appleScriptQuote(value: string): string {
 	return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r?\n/g, " ");
 }
 
 function runDetached(command: string, args: string[]): void {
-	execFile(command, args, { windowsHide: true }, () => {
-		// Swallow errors. Notifications should never break the agent.
+	execFile(command, args, { windowsHide: true }, (error) => {
+		if (error) console.error(`[pi-notify-agent] ${command}: ${error.message}`);
+	});
+}
+
+function runCommand(command: string, args: string[]): Promise<boolean> {
+	return new Promise((resolve) => {
+		execFile(command, args, { windowsHide: true }, (error) => {
+			if (error) console.error(`[pi-notify-agent] ${command}: ${error.message}`);
+			resolve(!error);
+		});
 	});
 }
 
@@ -89,21 +105,19 @@ function windowsToastScript(title: string, body: string): string {
 	const type = "Windows.UI.Notifications";
 	const manager = `[${type}.ToastNotificationManager, ${type}, ContentType = WindowsRuntime]`;
 	const xmlDocument = "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]";
-	const template = '<toast><visual><binding template="ToastGeneric"><text/><text/></binding></visual></toast>';
-	const appName = psQuote(APP_NAME);
-	const safeTitle = psQuote(title);
-	const safeBody = psQuote(body);
+	const template = `<toast duration="long"><visual><binding template="ToastGeneric"><text>${xmlEscape(title)}</text><text>${xmlEscape(body)}</text></binding></visual></toast>`;
+	const safeTemplate = psQuote(template);
 
 	return [
+		`$ErrorActionPreference = 'Stop'`,
+		`$appId = Get-StartApps | Where-Object { $_.AppID -like '*\\WindowsPowerShell\\v1.0\\powershell.exe' } | Select-Object -First 1 -ExpandProperty AppID`,
+		`if (!$appId) { throw 'Windows PowerShell AppUserModelID not found' }`,
 		`${manager} > $null`,
 		`${xmlDocument} > $null`,
 		`$xml = [Windows.Data.Xml.Dom.XmlDocument]::new()`,
-		`$xml.LoadXml('${template}')`,
-		`$textNodes = $xml.GetElementsByTagName('text')`,
-		`$textNodes[0].AppendChild($xml.CreateTextNode('${safeTitle}')) > $null`,
-		`$textNodes[1].AppendChild($xml.CreateTextNode('${safeBody}')) > $null`,
+		`$xml.LoadXml('${safeTemplate}')`,
 		`$toast = [${type}.ToastNotification]::new($xml)`,
-		`[${type}.ToastNotificationManager]::CreateToastNotifier('${appName}').Show($toast)`,
+		`[${type}.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)`,
 	].join("; ");
 }
 
@@ -124,20 +138,17 @@ function sendTerminalNotification(title: string, body: string): void {
 	notifyOsc777(title, body);
 }
 
-function sendDesktopNotification(title: string, body: string): boolean {
+async function sendDesktopNotification(title: string, body: string): Promise<boolean> {
 	if (canUseWindowsToast()) {
-		runDetached("powershell.exe", ["-NoProfile", "-Command", windowsToastScript(title, body)]);
-		return true;
+		return runCommand("powershell.exe", ["-NoProfile", "-Command", windowsToastScript(title, body)]);
 	}
 
 	if (isMac() && commandExists("osascript")) {
-		runDetached("osascript", ["-e", `display notification \"${appleScriptQuote(body)}\" with title \"${appleScriptQuote(title)}\"`]);
-		return true;
+		return runCommand("osascript", ["-e", `display notification \"${appleScriptQuote(body)}\" with title \"${appleScriptQuote(title)}\"`]);
 	}
 
 	if (isLinux() && hasDesktopSession() && commandExists("notify-send")) {
-		runDetached("notify-send", [title, body]);
-		return true;
+		return runCommand("notify-send", [title, body]);
 	}
 
 	return false;
@@ -242,7 +253,7 @@ function resolveOutcome(
 	return { outcome: "other", reason: stopReason ?? "unknown" };
 }
 
-function notifyOutcome(
+async function notifyOutcome(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	durationMs: number,
@@ -251,7 +262,7 @@ function notifyOutcome(
 	attentionEnabled: boolean,
 	reason?: string,
 	messagePreview?: string,
-): void {
+): Promise<void> {
 	const label = getProjectLabel(ctx, pi);
 	const duration = formatDuration(durationMs);
 	const title = kind === "success" ? "Pi - Job finished" : "Pi - Agent stopped with error";
@@ -260,7 +271,7 @@ function notifyOutcome(
 	if (kind === "error" && reason) body += ` • ${reason}`;
 	else if (messagePreview) body += ` • ${messagePreview}`;
 
-	if (!sendDesktopNotification(title, body)) {
+	if (!(await sendDesktopNotification(title, body))) {
 		sendTerminalNotification(title, body);
 	}
 
@@ -340,12 +351,12 @@ export default function notifyExtension(pi: ExtensionAPI): void {
 		if (outcome === "aborted") return;
 		if (outcome === "success") {
 			if (!notifySuccess) return;
-			notifyOutcome(pi, ctx, durationMs, "success", soundEnabled, attentionEnabled, undefined, preview);
+			await notifyOutcome(pi, ctx, durationMs, "success", soundEnabled, attentionEnabled, undefined, preview);
 			return;
 		}
 
 		if (!notifyError) return;
-		notifyOutcome(pi, ctx, durationMs, "error", soundEnabled, attentionEnabled, reason, preview);
+		await notifyOutcome(pi, ctx, durationMs, "error", soundEnabled, attentionEnabled, reason, preview);
 	});
 
 	pi.registerCommand("notify-test", {
@@ -355,7 +366,7 @@ export default function notifyExtension(pi: ExtensionAPI): void {
 			const kind: NotifyKind = mode === "error" ? "error" : "success";
 			const soundEnabled = parseBoolean(pi.getFlag("notify-sound"), true);
 			const attentionEnabled = parseBoolean(pi.getFlag("notify-attention"), true);
-			notifyOutcome(
+			await notifyOutcome(
 				pi,
 				ctx,
 				4200,
