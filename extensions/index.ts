@@ -88,14 +88,17 @@ function getProjectLabel(ctx: ExtensionContext, pi: ExtensionAPI): string {
 function windowsToastScript(title: string, body: string): string {
 	const type = "Windows.UI.Notifications";
 	const manager = `[${type}.ToastNotificationManager, ${type}, ContentType = WindowsRuntime]`;
-	const template = `[${type}.ToastTemplateType]::ToastText02`;
+	const xmlDocument = "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]";
+	const template = '<toast><visual><binding template="ToastGeneric"><text/><text/></binding></visual></toast>';
 	const appName = psQuote(APP_NAME);
 	const safeTitle = psQuote(title);
 	const safeBody = psQuote(body);
 
 	return [
 		`${manager} > $null`,
-		`$xml = [${type}.ToastNotificationManager]::GetTemplateContent(${template})`,
+		`${xmlDocument} > $null`,
+		`$xml = [Windows.Data.Xml.Dom.XmlDocument]::new()`,
+		`$xml.LoadXml('${template}')`,
 		`$textNodes = $xml.GetElementsByTagName('text')`,
 		`$textNodes[0].AppendChild($xml.CreateTextNode('${safeTitle}')) > $null`,
 		`$textNodes[1].AppendChild($xml.CreateTextNode('${safeBody}')) > $null`,
