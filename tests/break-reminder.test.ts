@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
-import { getNextBreakReminderTime, isBreakReminderTime, startBreakReminderCoordinator } from "../extensions/index.ts";
+import {
+	getNextBreakReminderTime,
+	isBreakReminderTime,
+	readNotifyLocalState,
+	startBreakReminderCoordinator,
+	updateNotifyLocalState,
+	writeNotifyLocalState,
+} from "../extensions/index.ts";
 
 const getAvailablePort = (): Promise<number> =>
 	new Promise((resolve, reject) => {
@@ -31,6 +41,20 @@ test("计算下一次休息提醒而不轮询", () => {
 	assert.deepEqual(getNextBreakReminderTime(new Date(2026, 2, 2, 10, 0, 1)), new Date(2026, 2, 2, 11, 0));
 	assert.deepEqual(getNextBreakReminderTime(new Date(2026, 2, 6, 18, 30)), new Date(2026, 2, 9, 10, 0));
 	assert.deepEqual(getNextBreakReminderTime(new Date(2026, 2, 6, 18, 30), true), new Date(2026, 2, 7, 10, 0));
+});
+
+test("统一持久化本地通知状态", (t) => {
+	const dir = mkdtempSync(path.join(tmpdir(), "pi-notify-state-"));
+	const filePath = path.join(dir, "local-state", "pi-notify-agent.json");
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+	writeNotifyLocalState({ version: 1, wechatEnabled: false, breakWeekendsEnabled: true }, filePath);
+	assert.deepEqual(readNotifyLocalState(filePath), { version: 1, wechatEnabled: false, breakWeekendsEnabled: true });
+	assert.deepEqual(updateNotifyLocalState({ wechatEnabled: true }, filePath), {
+		version: 1,
+		wechatEnabled: true,
+		breakWeekendsEnabled: true,
+	});
 });
 
 test("多会话只保留一个提醒主会话并在退出后接管", { timeout: 3000 }, async (t) => {

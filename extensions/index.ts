@@ -1,5 +1,5 @@
 import { execFile, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -13,6 +13,7 @@ const BREAK_REMINDER_HOST = "127.0.0.1";
 const BREAK_REMINDER_PORT = 54_273;
 const BREAK_REMINDER_PROTOCOL = "pi-notify-agent/break-reminder/v1\n";
 const BREAK_REMINDER_HANDSHAKE_MS = 1000;
+const NOTIFY_LOCAL_STATE_VERSION = 1;
 const LINUX_SOUND_FILES = [
 	"/usr/share/sounds/freedesktop/stereo/complete.oga",
 	"/usr/share/sounds/freedesktop/stereo/message.oga",
@@ -23,6 +24,11 @@ type AgentOutcome = "success" | "error" | "aborted" | "other";
 type NotifyKind = "success" | "error";
 type SoundPlayback = "external" | "terminal-bell";
 export type BreakReminderRole = "leader" | "follower" | "inactive";
+export type NotifyLocalState = {
+	version: typeof NOTIFY_LOCAL_STATE_VERSION;
+	wechatEnabled: boolean;
+	breakWeekendsEnabled: boolean;
+};
 type WechatConfig = { appId: string; appSecret: string; openId: string; templateId: string };
 export type WechatTemplateData = { project: string; status: string; duration: string; time: string; summary: string };
 type WechatTokenResponse = { access_token?: string; expires_in?: number; errcode?: number; errmsg?: string };
@@ -224,22 +230,42 @@ export const hasWechatConfig = (): boolean =>
 	["WECHAT_APP_ID", "WECHAT_APP_SECRET", "WECHAT_OPEN_ID", "WECHAT_TEMPLATE_ID"].every((key) => Boolean(process.env[key]?.trim()));
 
 const wechatEnvPath = (): string => path.join(homedir(), ".pi", "agent", "private", "env", "wechat.env");
+const legacyBreakWeekendsPath = (): string => path.join(homedir(), ".pi", "agent", "notify-break-weekends");
+const notifyLocalStatePath = (): string => path.join(homedir(), ".pi", "agent", "local-state", "pi-notify-agent.json");
 
-const setWechatNotifyEnabled = (enabled: boolean): void => {
-	const value = enabled ? "on" : "off";
-	process.env.WECHAT_NOTIFY_ENABLED = value;
-	const filePath = wechatEnvPath();
-	const current = existsSync(filePath) ? readFileSync(filePath, "utf8") : "";
-	const next = /^WECHAT_NOTIFY_ENABLED=/m.test(current)
-		? current.replace(/^WECHAT_NOTIFY_ENABLED=.*$/m, `WECHAT_NOTIFY_ENABLED=${value}`)
-		: `${current.trimEnd()}${current.trim() ? "\n" : ""}WECHAT_NOTIFY_ENABLED=${value}\n`;
-	writeFileSync(filePath, next.endsWith("\n") ? next : `${next}\n`);
-}
+const validateNotifyLocalState = (value: unknown, filePath: string): NotifyLocalState => {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`本地通知状态无效：${filePath}`);
+	const state = value as Partial<NotifyLocalState>;
+	if (
+		state.version !== NOTIFY_LOCAL_STATE_VERSION ||
+		typeof state.wechatEnabled !== "boolean" ||
+		typeof state.breakWeekendsEnabled !== "boolean"
+	) throw new Error(`本地通知状态无效：${filePath}`);
+	return state as NotifyLocalState;
+};
 
-const breakWeekendsConfigPath = (): string => path.join(homedir(), ".pi", "agent", "notify-break-weekends");
+export const readNotifyLocalState = (filePath = notifyLocalStatePath()): NotifyLocalState =>
+	validateNotifyLocalState(JSON.parse(readFileSync(filePath, "utf8")), filePath);
 
-const readBreakWeekendsEnabled = (fallback: boolean): boolean => {
-	const filePath = breakWeekendsConfigPath();
+export const writeNotifyLocalState = (state: NotifyLocalState, filePath = notifyLocalStatePath()): void => {
+	const validated = validateNotifyLocalState(state, filePath);
+	mkdirSync(path.dirname(filePath), { recursive: true });
+	const tempPath = `${filePath}.${process.pid}.tmp`;
+	writeFileSync(tempPath, `${JSON.stringify(validated, null, 2)}\n`, "utf8");
+	renameSync(tempPath, filePath);
+};
+
+export const updateNotifyLocalState = (
+	patch: Partial<Pick<NotifyLocalState, "wechatEnabled" | "breakWeekendsEnabled">>,
+	filePath = notifyLocalStatePath(),
+): NotifyLocalState => {
+	const state = { ...readNotifyLocalState(filePath), ...patch };
+	writeNotifyLocalState(state, filePath);
+	return state;
+};
+
+const readLegacyBreakWeekendsEnabled = (fallback: boolean): boolean => {
+	const filePath = legacyBreakWeekendsPath();
 	if (!existsSync(filePath)) return fallback;
 	const value = readFileSync(filePath, "utf8").trim();
 	if (value === "on") return true;
@@ -247,8 +273,23 @@ const readBreakWeekendsEnabled = (fallback: boolean): boolean => {
 	throw new Error(`周末休息提醒配置无效：${filePath}`);
 };
 
-const setBreakWeekendsEnabled = (enabled: boolean): void => {
-	writeFileSync(breakWeekendsConfigPath(), enabled ? "on\n" : "off\n");
+const removeLegacyLocalState = (): void => {
+	const envPath = wechatEnvPath();
+	if (existsSync(envPath)) {
+		const current = readFileSync(envPath, "utf8");
+		const next = current.replace(/^WECHAT_NOTIFY_ENABLED=.*(?:\r?\n|$)/gm, "");
+		if (next !== current) writeFileSync(envPath, next, "utf8");
+	}
+	rmSync(legacyBreakWeekendsPath(), { force: true });
+	delete process.env.WECHAT_NOTIFY_ENABLED;
+};
+
+const loadNotifyLocalState = (defaults: Omit<NotifyLocalState, "version">): NotifyLocalState => {
+	const filePath = notifyLocalStatePath();
+	if (!existsSync(filePath)) writeNotifyLocalState({ version: NOTIFY_LOCAL_STATE_VERSION, ...defaults }, filePath);
+	const state = readNotifyLocalState(filePath);
+	removeLegacyLocalState();
+	return state;
 };
 
 function firstLine(text: string | undefined): string | undefined {
@@ -577,15 +618,16 @@ export default function notifyExtension(pi: ExtensionAPI): void {
 	let breakReminderCoordinator: { stop: () => void } | undefined;
 	let breakReminderRole: BreakReminderRole = "inactive";
 	let lastBreakReminderKey: string | undefined;
-	let breakWeekendsEnabled = readBreakWeekendsEnabled(parseBoolean(pi.getFlag("notify-break-weekends"), false));
-	let wechatEnabled: boolean | undefined;
-	const isWechatEnabled = (): boolean =>
-		wechatEnabled ?? parseBoolean(process.env.WECHAT_NOTIFY_ENABLED, parseBoolean(pi.getFlag("notify-wechat"), false));
+	let localState = loadNotifyLocalState({
+		breakWeekendsEnabled: readLegacyBreakWeekendsEnabled(parseBoolean(pi.getFlag("notify-break-weekends"), false)),
+		wechatEnabled: parseBoolean(process.env.WECHAT_NOTIFY_ENABLED, parseBoolean(pi.getFlag("notify-wechat"), false)),
+	});
+	const isWechatEnabled = (): boolean => localState.wechatEnabled;
 
 	const checkBreakReminder = async (ctx: ExtensionContext): Promise<void> => {
 		const now = new Date();
 		const key = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}-${now.getHours()}-${now.getMinutes()}`;
-		if (!isBreakReminderTime(now, breakWeekendsEnabled) || key === lastBreakReminderKey) return;
+		if (!isBreakReminderTime(now, localState.breakWeekendsEnabled) || key === lastBreakReminderKey) return;
 		lastBreakReminderKey = key;
 		await notifyBreak(pi, ctx);
 	};
@@ -593,7 +635,7 @@ export default function notifyExtension(pi: ExtensionAPI): void {
 	const scheduleBreakReminder = (ctx: ExtensionContext): void => {
 		if (breakReminderRole !== "leader") return;
 		if (breakReminderTimer) clearTimeout(breakReminderTimer);
-		const delay = getNextBreakReminderTime(new Date(), breakWeekendsEnabled).getTime() - Date.now();
+		const delay = getNextBreakReminderTime(new Date(), localState.breakWeekendsEnabled).getTime() - Date.now();
 		breakReminderTimer = setTimeout(() => {
 			void checkBreakReminder(ctx)
 				.catch((error) => console.error(`[pi-notify-agent] break reminder: ${String(error)}`))
@@ -700,8 +742,7 @@ export default function notifyExtension(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			const action = args.trim().toLowerCase() || "status";
 			if (action === "on" || action === "off") {
-				breakWeekendsEnabled = action === "on";
-				setBreakWeekendsEnabled(breakWeekendsEnabled);
+				localState = updateNotifyLocalState({ breakWeekendsEnabled: action === "on" });
 				if (breakReminderRole === "leader") {
 					await checkBreakReminder(ctx);
 					scheduleBreakReminder(ctx);
@@ -710,7 +751,7 @@ export default function notifyExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify("用法：/notify-break-weekends [on|off|status]", "warning");
 				return;
 			}
-			ctx.ui.notify(`notify-break-weekends: ${breakWeekendsEnabled ? "on" : "off"}`, "info");
+			ctx.ui.notify(`notify-break-weekends: ${localState.breakWeekendsEnabled ? "on" : "off"}`, "info");
 		},
 	});
 
@@ -731,11 +772,9 @@ export default function notifyExtension(pi: ExtensionAPI): void {
 			}
 			if (action === "on") {
 				getWechatConfig();
-				setWechatNotifyEnabled(true);
-				wechatEnabled = true;
+				localState = updateNotifyLocalState({ wechatEnabled: true });
 			} else if (action === "off") {
-				setWechatNotifyEnabled(false);
-				wechatEnabled = false;
+				localState = updateNotifyLocalState({ wechatEnabled: false });
 			} else if (action !== "status") {
 				ctx.ui.notify("用法：/notify-wechat [on|off|status|test]", "warning");
 				return;
@@ -751,6 +790,7 @@ export default function notifyExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("notify-status", {
 		description: "Show active notification settings",
 		handler: async (_args, ctx) => {
+			localState = readNotifyLocalState();
 			const minMs = parseMinMs(pi.getFlag("notify-min-ms"));
 			const success = parseBoolean(pi.getFlag("notify-success"), true);
 			const error = parseBoolean(pi.getFlag("notify-error"), true);
@@ -762,10 +802,11 @@ export default function notifyExtension(pi: ExtensionAPI): void {
 				`notify-error: ${error ? "on" : "off"}`,
 				`notify-sound: ${sound ? "on" : "off"}`,
 				`notify-attention: ${attention ? "on" : "off"}`,
-				`notify-break-weekends: ${breakWeekendsEnabled ? "on" : "off"}`,
+				`notify-break-weekends: ${localState.breakWeekendsEnabled ? "on" : "off"}`,
 				`break-reminder-role: ${breakReminderRole}`,
 				`notify-wechat: ${isWechatEnabled() ? "on" : "off"}`,
 				`wechat-test-account: ${hasWechatConfig() ? "configured" : "missing"}`,
+				`local-state: ${notifyLocalStatePath()}`,
 				"break-reminder: weekdays 10:00, 11:00, 12:00, 14:30, 15:30, 16:30, 17:30, 18:30",
 				"hint: attention uses BEL, so supporting terminals can flash taskbar/dock/tab.",
 			];
