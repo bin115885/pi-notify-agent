@@ -1,5 +1,7 @@
 import { execFile, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { homedir } from "node:os";
 import path from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, TextContent } from "@mariozechner/pi-ai";
@@ -7,7 +9,10 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 
 const DEFAULT_MIN_NOTIFY_MS = 3000;
 const BREAK_REMINDER_TIMES = new Set(["10:00", "11:00", "12:00", "14:30", "15:30", "16:30", "17:30", "18:30"]);
-const BREAK_REMINDER_CHECK_MS = 30_000;
+const BREAK_REMINDER_HOST = "127.0.0.1";
+const BREAK_REMINDER_PORT = 54_273;
+const BREAK_REMINDER_PROTOCOL = "pi-notify-agent/break-reminder/v1\n";
+const BREAK_REMINDER_HANDSHAKE_MS = 1000;
 const LINUX_SOUND_FILES = [
 	"/usr/share/sounds/freedesktop/stereo/complete.oga",
 	"/usr/share/sounds/freedesktop/stereo/message.oga",
@@ -17,8 +22,14 @@ const LINUX_SOUND_FILES = [
 type AgentOutcome = "success" | "error" | "aborted" | "other";
 type NotifyKind = "success" | "error";
 type SoundPlayback = "external" | "terminal-bell";
+export type BreakReminderRole = "leader" | "follower" | "inactive";
+type WechatConfig = { appId: string; appSecret: string; openId: string; templateId: string };
+export type WechatTemplateData = { project: string; status: string; duration: string; time: string; summary: string };
+type WechatTokenResponse = { access_token?: string; expires_in?: number; errcode?: number; errmsg?: string };
+type WechatTemplateResponse = { errcode?: number; errmsg?: string; msgid?: number };
 
 const commandExistsCache = new Map<string, boolean>();
+let wechatAccessToken: { appId: string; value: string; expiresAt: number } | undefined;
 
 function psQuote(value: string): string {
 	return value.replace(/'/g, "''");
@@ -87,10 +98,157 @@ function formatDuration(ms: number): string {
 	return `${Math.round(seconds)}s`;
 }
 
-export const isBreakReminderTime = (now: Date): boolean => {
+export const isBreakReminderTime = (now: Date, weekendsEnabled = false): boolean => {
 	const day = now.getDay();
 	const time = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
-	return day >= 1 && day <= 5 && BREAK_REMINDER_TIMES.has(time);
+	return BREAK_REMINDER_TIMES.has(time) && (weekendsEnabled || (day >= 1 && day <= 5));
+};
+
+export const getNextBreakReminderTime = (now: Date, weekendsEnabled = false): Date => {
+	for (let dayOffset = 0; dayOffset < 8; dayOffset += 1) {
+		for (const time of BREAK_REMINDER_TIMES) {
+			const [hour, minute] = time.split(":").map(Number);
+			const candidate = new Date(now);
+			candidate.setDate(now.getDate() + dayOffset);
+			candidate.setHours(hour, minute, 0, 0);
+			if (candidate.getTime() > now.getTime() && isBreakReminderTime(candidate, weekendsEnabled)) return candidate;
+		}
+	}
+	throw new Error("无法计算下一次休息提醒时间");
+};
+
+export const startBreakReminderCoordinator = (
+	onRoleChange: (role: BreakReminderRole) => void,
+	onError: (error: Error) => void,
+	port = BREAK_REMINDER_PORT,
+): { stop: () => void } => {
+	let active = true;
+	let server: Server | undefined;
+	let follower: Socket | undefined;
+	const clients = new Set<Socket>();
+
+	const fail = (error: Error): void => {
+		active = false;
+		follower?.destroy();
+		follower = undefined;
+		onRoleChange("inactive");
+		onError(error);
+	};
+
+	const compete = (): void => {
+		if (!active) return;
+		const candidate = createServer((socket) => {
+			clients.add(socket);
+			socket.once("error", () => socket.destroy());
+			socket.once("close", () => clients.delete(socket));
+			socket.write(BREAK_REMINDER_PROTOCOL);
+		});
+
+		candidate.once("error", (error: NodeJS.ErrnoException) => {
+			if (!active) return;
+			if (error.code !== "EADDRINUSE") {
+				fail(error);
+				return;
+			}
+
+			let response = "";
+			let verified = false;
+			const socket = createConnection({ host: BREAK_REMINDER_HOST, port });
+			follower = socket;
+			const handshakeTimer = setTimeout(() => {
+				fail(new Error(`休息提醒端口 ${port} 被非 pi-notify-agent 进程占用`));
+			}, BREAK_REMINDER_HANDSHAKE_MS);
+
+			socket.setEncoding("utf8");
+			socket.on("data", (data) => {
+				response += data;
+				if (response.length < BREAK_REMINDER_PROTOCOL.length) return;
+				clearTimeout(handshakeTimer);
+				if (response !== BREAK_REMINDER_PROTOCOL) {
+					fail(new Error(`休息提醒端口 ${port} 协议不匹配`));
+					return;
+				}
+				verified = true;
+				onRoleChange("follower");
+			});
+			socket.once("error", () => socket.destroy());
+			socket.once("close", () => {
+				clearTimeout(handshakeTimer);
+				follower = undefined;
+				if (!active) return;
+				if (verified) onRoleChange("inactive");
+				setImmediate(compete);
+			});
+		});
+
+		candidate.listen(port, BREAK_REMINDER_HOST, () => {
+			if (!active) {
+				candidate.close();
+				return;
+			}
+			server = candidate;
+			onRoleChange("leader");
+		});
+	};
+
+	compete();
+	return {
+		stop: () => {
+			if (!active) return;
+			active = false;
+			follower?.destroy();
+			follower = undefined;
+			server?.close();
+			server = undefined;
+			for (const client of clients) client.destroy();
+			clients.clear();
+			onRoleChange("inactive");
+		},
+	};
+};
+
+const requireWechatEnv = (key: string): string => {
+	const value = process.env[key]?.trim();
+	if (!value) throw new Error(`微信测试号配置缺失：${key}`);
+	return value;
+};
+
+const getWechatConfig = (): WechatConfig => ({
+	appId: requireWechatEnv("WECHAT_APP_ID"),
+	appSecret: requireWechatEnv("WECHAT_APP_SECRET"),
+	openId: requireWechatEnv("WECHAT_OPEN_ID"),
+	templateId: requireWechatEnv("WECHAT_TEMPLATE_ID"),
+});
+
+export const hasWechatConfig = (): boolean =>
+	["WECHAT_APP_ID", "WECHAT_APP_SECRET", "WECHAT_OPEN_ID", "WECHAT_TEMPLATE_ID"].every((key) => Boolean(process.env[key]?.trim()));
+
+const wechatEnvPath = (): string => path.join(homedir(), ".pi", "agent", "private", "env", "wechat.env");
+
+const setWechatNotifyEnabled = (enabled: boolean): void => {
+	const value = enabled ? "on" : "off";
+	process.env.WECHAT_NOTIFY_ENABLED = value;
+	const filePath = wechatEnvPath();
+	const current = existsSync(filePath) ? readFileSync(filePath, "utf8") : "";
+	const next = /^WECHAT_NOTIFY_ENABLED=/m.test(current)
+		? current.replace(/^WECHAT_NOTIFY_ENABLED=.*$/m, `WECHAT_NOTIFY_ENABLED=${value}`)
+		: `${current.trimEnd()}${current.trim() ? "\n" : ""}WECHAT_NOTIFY_ENABLED=${value}\n`;
+	writeFileSync(filePath, next.endsWith("\n") ? next : `${next}\n`);
+}
+
+const breakWeekendsConfigPath = (): string => path.join(homedir(), ".pi", "agent", "notify-break-weekends");
+
+const readBreakWeekendsEnabled = (fallback: boolean): boolean => {
+	const filePath = breakWeekendsConfigPath();
+	if (!existsSync(filePath)) return fallback;
+	const value = readFileSync(filePath, "utf8").trim();
+	if (value === "on") return true;
+	if (value === "off") return false;
+	throw new Error(`周末休息提醒配置无效：${filePath}`);
+};
+
+const setBreakWeekendsEnabled = (enabled: boolean): void => {
+	writeFileSync(breakWeekendsConfigPath(), enabled ? "on\n" : "off\n");
 };
 
 function firstLine(text: string | undefined): string | undefined {
@@ -260,7 +418,6 @@ function resolveOutcome(
 	}
 	return { outcome: "other", reason: stopReason ?? "unknown" };
 }
-
 async function deliverNotification(
 	title: string,
 	body: string,
@@ -276,6 +433,65 @@ async function deliverNotification(
 		requestTerminalAttention();
 	}
 }
+
+async function getWechatAccessToken(config: WechatConfig, forceRefresh = false): Promise<string> {
+	if (!forceRefresh && wechatAccessToken?.appId === config.appId && Date.now() < wechatAccessToken.expiresAt) {
+		return wechatAccessToken.value;
+	}
+
+	const response = await fetch("https://api.weixin.qq.com/cgi-bin/stable_token", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({
+			grant_type: "client_credential",
+			appid: config.appId,
+			secret: config.appSecret,
+			force_refresh: forceRefresh,
+		}),
+	});
+	const result = (await response.json()) as WechatTokenResponse;
+	if (!response.ok || !result.access_token || !result.expires_in) {
+		throw new Error(`微信 access_token 获取失败：HTTP ${response.status}，errcode ${String(result.errcode)}，${result.errmsg ?? "响应格式无效"}`);
+	}
+
+	wechatAccessToken = {
+		appId: config.appId,
+		value: result.access_token,
+		expiresAt: Date.now() + Math.max(result.expires_in - 60, 0) * 1000,
+	};
+	return wechatAccessToken.value;
+}
+
+export async function sendWechatNotification(data: WechatTemplateData): Promise<void> {
+	const config = getWechatConfig();
+	const payload = {
+		touser: config.openId,
+		template_id: config.templateId,
+		data: Object.fromEntries(Object.entries(data).map(([key, value]) => [key, { value }])),
+	};
+
+	const sendOnce = async (accessToken: string) => {
+		const response = await fetch(`https://api.weixin.qq.com/cgi-bin/message/template/send?access_token=${encodeURIComponent(accessToken)}`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(payload),
+		});
+		const result = (await response.json()) as WechatTemplateResponse;
+		return { response, result };
+	};
+
+	let accessToken = await getWechatAccessToken(config);
+	let { response, result } = await sendOnce(accessToken);
+	if (result.errcode === 40001) {
+		wechatAccessToken = undefined;
+		accessToken = await getWechatAccessToken(config, true);
+		({ response, result } = await sendOnce(accessToken));
+	}
+	if (!response.ok || result.errcode !== 0) {
+		throw new Error(`微信模板消息发送失败：HTTP ${response.status}，errcode ${String(result.errcode)}，${result.errmsg ?? "响应格式无效"}`);
+	}
+}
+
 
 async function notifyBreak(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
 	await deliverNotification(
@@ -293,6 +509,7 @@ async function notifyOutcome(
 	kind: NotifyKind,
 	soundEnabled: boolean,
 	attentionEnabled: boolean,
+	wechatEnabled: boolean,
 	reason?: string,
 	messagePreview?: string,
 ): Promise<void> {
@@ -305,6 +522,15 @@ async function notifyOutcome(
 	else if (messagePreview) body += ` • ${messagePreview}`;
 
 	await deliverNotification(title, body, soundEnabled, attentionEnabled);
+	if (wechatEnabled) {
+		await sendWechatNotification({
+			project: label,
+			status: kind === "success" ? "成功" : "失败",
+			duration,
+			time: new Date().toLocaleString("zh-CN", { hour12: false }),
+			summary: body,
+		});
+	}
 }
 
 export default function notifyExtension(pi: ExtensionAPI): void {
@@ -333,29 +559,71 @@ export default function notifyExtension(pi: ExtensionAPI): void {
 		type: "string",
 		default: "on",
 	});
+	pi.registerFlag("notify-break-weekends", {
+		description: "Send scheduled break reminders on weekends: on/off",
+		type: "string",
+		default: "off",
+	});
+	pi.registerFlag("notify-wechat", {
+		description: "Send agent completion notifications through the official WeChat test account: on/off",
+		type: "string",
+		default: "off",
+	});
 
 	let agentStartedAt: number | null = null;
 	let lastProviderErrorStatus: number | null = null;
 	let lastAssistantThisRun: AssistantMessage | undefined;
-	let breakReminderTimer: ReturnType<typeof setInterval> | undefined;
+	let breakReminderTimer: ReturnType<typeof setTimeout> | undefined;
+	let breakReminderCoordinator: { stop: () => void } | undefined;
+	let breakReminderRole: BreakReminderRole = "inactive";
 	let lastBreakReminderKey: string | undefined;
+	let breakWeekendsEnabled = readBreakWeekendsEnabled(parseBoolean(pi.getFlag("notify-break-weekends"), false));
+	let wechatEnabled: boolean | undefined;
+	const isWechatEnabled = (): boolean =>
+		wechatEnabled ?? parseBoolean(process.env.WECHAT_NOTIFY_ENABLED, parseBoolean(pi.getFlag("notify-wechat"), false));
 
 	const checkBreakReminder = async (ctx: ExtensionContext): Promise<void> => {
 		const now = new Date();
 		const key = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}-${now.getHours()}-${now.getMinutes()}`;
-		if (!isBreakReminderTime(now) || key === lastBreakReminderKey) return;
+		if (!isBreakReminderTime(now, breakWeekendsEnabled) || key === lastBreakReminderKey) return;
 		lastBreakReminderKey = key;
 		await notifyBreak(pi, ctx);
 	};
 
+	const scheduleBreakReminder = (ctx: ExtensionContext): void => {
+		if (breakReminderRole !== "leader") return;
+		if (breakReminderTimer) clearTimeout(breakReminderTimer);
+		const delay = getNextBreakReminderTime(new Date(), breakWeekendsEnabled).getTime() - Date.now();
+		breakReminderTimer = setTimeout(() => {
+			void checkBreakReminder(ctx)
+				.catch((error) => console.error(`[pi-notify-agent] break reminder: ${String(error)}`))
+				.finally(() => scheduleBreakReminder(ctx));
+		}, delay);
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
-		if (breakReminderTimer) clearInterval(breakReminderTimer);
-		await checkBreakReminder(ctx);
-		breakReminderTimer = setInterval(() => void checkBreakReminder(ctx), BREAK_REMINDER_CHECK_MS);
+		breakReminderCoordinator?.stop();
+		breakReminderCoordinator = startBreakReminderCoordinator(
+			(role) => {
+				breakReminderRole = role;
+				if (breakReminderTimer) clearTimeout(breakReminderTimer);
+				breakReminderTimer = undefined;
+				if (role !== "leader") return;
+				void checkBreakReminder(ctx)
+					.catch((error) => console.error(`[pi-notify-agent] break reminder: ${String(error)}`))
+					.finally(() => scheduleBreakReminder(ctx));
+			},
+			(error) => {
+				console.error(`[pi-notify-agent] break reminder coordinator: ${error.message}`);
+				ctx.ui.notify(error.message, "error");
+			},
+		);
 	});
 
 	pi.on("session_shutdown", async () => {
-		if (breakReminderTimer) clearInterval(breakReminderTimer);
+		breakReminderCoordinator?.stop();
+		breakReminderCoordinator = undefined;
+		if (breakReminderTimer) clearTimeout(breakReminderTimer);
 		breakReminderTimer = undefined;
 	});
 
@@ -398,12 +666,12 @@ export default function notifyExtension(pi: ExtensionAPI): void {
 		if (outcome === "aborted") return;
 		if (outcome === "success") {
 			if (!notifySuccess) return;
-			await notifyOutcome(pi, ctx, durationMs, "success", soundEnabled, attentionEnabled, undefined, preview);
+			await notifyOutcome(pi, ctx, durationMs, "success", soundEnabled, attentionEnabled, isWechatEnabled(), undefined, preview);
 			return;
 		}
 
 		if (!notifyError) return;
-		await notifyOutcome(pi, ctx, durationMs, "error", soundEnabled, attentionEnabled, reason, preview);
+		await notifyOutcome(pi, ctx, durationMs, "error", soundEnabled, attentionEnabled, isWechatEnabled(), reason, preview);
 	});
 
 	pi.registerCommand("notify-test", {
@@ -420,10 +688,63 @@ export default function notifyExtension(pi: ExtensionAPI): void {
 				kind,
 				soundEnabled,
 				attentionEnabled,
+				isWechatEnabled(),
 				kind === "error" ? "manual test" : undefined,
 				"manual test",
 			);
 			ctx.ui.notify(`notify-test: ${kind}`, kind === "error" ? "warning" : "info");
+		},
+	});
+	pi.registerCommand("notify-break-weekends", {
+		description: "Control weekend break reminders: /notify-break-weekends [on|off|status]",
+		handler: async (args, ctx) => {
+			const action = args.trim().toLowerCase() || "status";
+			if (action === "on" || action === "off") {
+				breakWeekendsEnabled = action === "on";
+				setBreakWeekendsEnabled(breakWeekendsEnabled);
+				if (breakReminderRole === "leader") {
+					await checkBreakReminder(ctx);
+					scheduleBreakReminder(ctx);
+				}
+			} else if (action !== "status") {
+				ctx.ui.notify("用法：/notify-break-weekends [on|off|status]", "warning");
+				return;
+			}
+			ctx.ui.notify(`notify-break-weekends: ${breakWeekendsEnabled ? "on" : "off"}`, "info");
+		},
+	});
+
+	pi.registerCommand("notify-wechat", {
+		description: "Control official WeChat test-account notifications: /notify-wechat [on|off|status|test]",
+		handler: async (args, ctx) => {
+			const action = args.trim().toLowerCase() || "status";
+			if (action === "test") {
+				await sendWechatNotification({
+					project: getProjectLabel(ctx, pi),
+					status: "测试",
+					duration: "0s",
+					time: new Date().toLocaleString("zh-CN", { hour12: false }),
+					summary: "微信官方测试号连接正常",
+				});
+				ctx.ui.notify("微信测试通知已发送", "info");
+				return;
+			}
+			if (action === "on") {
+				getWechatConfig();
+				setWechatNotifyEnabled(true);
+				wechatEnabled = true;
+			} else if (action === "off") {
+				setWechatNotifyEnabled(false);
+				wechatEnabled = false;
+			} else if (action !== "status") {
+				ctx.ui.notify("用法：/notify-wechat [on|off|status|test]", "warning");
+				return;
+			}
+
+			ctx.ui.notify(
+				`notify-wechat: ${isWechatEnabled() ? "on" : "off"}\nwechat-test-account: ${hasWechatConfig() ? "configured" : "missing"}`,
+				"info",
+			);
 		},
 	});
 
@@ -441,6 +762,10 @@ export default function notifyExtension(pi: ExtensionAPI): void {
 				`notify-error: ${error ? "on" : "off"}`,
 				`notify-sound: ${sound ? "on" : "off"}`,
 				`notify-attention: ${attention ? "on" : "off"}`,
+				`notify-break-weekends: ${breakWeekendsEnabled ? "on" : "off"}`,
+				`break-reminder-role: ${breakReminderRole}`,
+				`notify-wechat: ${isWechatEnabled() ? "on" : "off"}`,
+				`wechat-test-account: ${hasWechatConfig() ? "configured" : "missing"}`,
 				"break-reminder: weekdays 10:00, 11:00, 12:00, 14:30, 15:30, 16:30, 17:30, 18:30",
 				"hint: attention uses BEL, so supporting terminals can flash taskbar/dock/tab.",
 			];
