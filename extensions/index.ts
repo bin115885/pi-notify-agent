@@ -6,6 +6,8 @@ import type { AssistantMessage, TextContent } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 const DEFAULT_MIN_NOTIFY_MS = 3000;
+const BREAK_REMINDER_TIMES = new Set(["10:00", "11:00", "12:00", "14:30", "15:30", "16:30", "17:30", "18:30"]);
+const BREAK_REMINDER_CHECK_MS = 30_000;
 const LINUX_SOUND_FILES = [
 	"/usr/share/sounds/freedesktop/stereo/complete.oga",
 	"/usr/share/sounds/freedesktop/stereo/message.oga",
@@ -84,6 +86,12 @@ function formatDuration(ms: number): string {
 	if (seconds < 10) return `${seconds.toFixed(1)}s`;
 	return `${Math.round(seconds)}s`;
 }
+
+export const isBreakReminderTime = (now: Date): boolean => {
+	const day = now.getDay();
+	const time = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+	return day >= 1 && day <= 5 && BREAK_REMINDER_TIMES.has(time);
+};
 
 function firstLine(text: string | undefined): string | undefined {
 	if (!text) return undefined;
@@ -253,6 +261,31 @@ function resolveOutcome(
 	return { outcome: "other", reason: stopReason ?? "unknown" };
 }
 
+async function deliverNotification(
+	title: string,
+	body: string,
+	soundEnabled: boolean,
+	attentionEnabled: boolean,
+): Promise<void> {
+	if (!(await sendDesktopNotification(title, body))) {
+		sendTerminalNotification(title, body);
+	}
+
+	const soundPlayback = soundEnabled ? playSound() : undefined;
+	if (attentionEnabled && soundPlayback !== "terminal-bell") {
+		requestTerminalAttention();
+	}
+}
+
+async function notifyBreak(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+	await deliverNotification(
+		"Pi - 休息提醒",
+		`${getProjectLabel(ctx, pi)} • 已连续工作一小时，起来活动一下。`,
+		parseBoolean(pi.getFlag("notify-sound"), true),
+		parseBoolean(pi.getFlag("notify-attention"), true),
+	);
+}
+
 async function notifyOutcome(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
@@ -271,14 +304,7 @@ async function notifyOutcome(
 	if (kind === "error" && reason) body += ` • ${reason}`;
 	else if (messagePreview) body += ` • ${messagePreview}`;
 
-	if (!(await sendDesktopNotification(title, body))) {
-		sendTerminalNotification(title, body);
-	}
-
-	const soundPlayback = soundEnabled ? playSound() : undefined;
-	if (attentionEnabled && soundPlayback !== "terminal-bell") {
-		requestTerminalAttention();
-	}
+	await deliverNotification(title, body, soundEnabled, attentionEnabled);
 }
 
 export default function notifyExtension(pi: ExtensionAPI): void {
@@ -311,6 +337,27 @@ export default function notifyExtension(pi: ExtensionAPI): void {
 	let agentStartedAt: number | null = null;
 	let lastProviderErrorStatus: number | null = null;
 	let lastAssistantThisRun: AssistantMessage | undefined;
+	let breakReminderTimer: ReturnType<typeof setInterval> | undefined;
+	let lastBreakReminderKey: string | undefined;
+
+	const checkBreakReminder = async (ctx: ExtensionContext): Promise<void> => {
+		const now = new Date();
+		const key = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}-${now.getHours()}-${now.getMinutes()}`;
+		if (!isBreakReminderTime(now) || key === lastBreakReminderKey) return;
+		lastBreakReminderKey = key;
+		await notifyBreak(pi, ctx);
+	};
+
+	pi.on("session_start", async (_event, ctx) => {
+		if (breakReminderTimer) clearInterval(breakReminderTimer);
+		await checkBreakReminder(ctx);
+		breakReminderTimer = setInterval(() => void checkBreakReminder(ctx), BREAK_REMINDER_CHECK_MS);
+	});
+
+	pi.on("session_shutdown", async () => {
+		if (breakReminderTimer) clearInterval(breakReminderTimer);
+		breakReminderTimer = undefined;
+	});
 
 	pi.on("agent_start", async () => {
 		agentStartedAt = Date.now();
@@ -394,6 +441,7 @@ export default function notifyExtension(pi: ExtensionAPI): void {
 				`notify-error: ${error ? "on" : "off"}`,
 				`notify-sound: ${sound ? "on" : "off"}`,
 				`notify-attention: ${attention ? "on" : "off"}`,
+				"break-reminder: weekdays 10:00, 11:00, 12:00, 14:30, 15:30, 16:30, 17:30, 18:30",
 				"hint: attention uses BEL, so supporting terminals can flash taskbar/dock/tab.",
 			];
 			ctx.ui.notify(lines.join("\n"), "info");
