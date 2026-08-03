@@ -61,6 +61,7 @@ test("macOS 休息提醒使用独立通知应用", { skip: process.platform !== 
 	});
 	assert.equal(iconName.stdout.trim(), "Clock.icns");
 	assert.equal(existsSync(path.join(appPath, "Contents", "Resources", "Clock.icns")), true);
+	assert.equal(existsSync(path.join(appPath, "Contents", "Resources", "utf8-v1")), true);
 	assert.equal(spawnSync("codesign", ["--verify", appPath]).status, 0);
 });
 

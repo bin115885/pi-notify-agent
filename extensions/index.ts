@@ -17,6 +17,7 @@ const NOTIFY_LOCAL_STATE_VERSION = 1;
 const MAC_BREAK_REMINDER_BUNDLE_ID = "com.bin115885.pi-notify-agent.break-reminder";
 const MAC_BREAK_REMINDER_APP_NAME = "Pi Break Reminder.app";
 const MAC_BREAK_REMINDER_ICON = "/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/Clock.icns";
+const MAC_BREAK_REMINDER_UTF8_MARKER = "utf8-v1";
 const LINUX_SOUND_FILES = [
 	"/usr/share/sounds/freedesktop/stereo/complete.oga",
 	"/usr/share/sounds/freedesktop/stereo/message.oga",
@@ -352,7 +353,10 @@ const macBreakReminderAppPath = (): string =>
 	path.join(homedir(), "Library", "Application Support", "pi-notify-agent", MAC_BREAK_REMINDER_APP_NAME);
 
 export async function ensureMacBreakReminderApp(appPath = macBreakReminderAppPath()): Promise<boolean> {
-	if (existsSync(path.join(appPath, "Contents", "Resources", "Clock.icns"))) return true;
+	if (
+		existsSync(path.join(appPath, "Contents", "Resources", "Clock.icns")) &&
+		existsSync(path.join(appPath, "Contents", "Resources", MAC_BREAK_REMINDER_UTF8_MARKER))
+	) return true;
 
 	mkdirSync(path.dirname(appPath), { recursive: true });
 	const temporaryPath = path.join(path.dirname(appPath), `.Pi Break Reminder.${process.pid}.app`);
@@ -363,13 +367,14 @@ export async function ensureMacBreakReminderApp(appPath = macBreakReminderAppPat
 			"-o",
 			temporaryPath,
 			"-e",
-			'set notificationTitle to system attribute "PI_BREAK_REMINDER_TITLE"',
+			'set notificationTitle to do shell script "/usr/bin/printf %s " & quoted form of (system attribute "PI_BREAK_REMINDER_TITLE") & " | /usr/bin/base64 -D"',
 			"-e",
-			'set notificationBody to system attribute "PI_BREAK_REMINDER_BODY"',
+			'set notificationBody to do shell script "/usr/bin/printf %s " & quoted form of (system attribute "PI_BREAK_REMINDER_BODY") & " | /usr/bin/base64 -D"',
 			"-e",
 			"display notification notificationBody with title notificationTitle",
 		]))) return false;
 		copyFileSync(MAC_BREAK_REMINDER_ICON, path.join(temporaryPath, "Contents", "Resources", "Clock.icns"));
+		writeFileSync(path.join(temporaryPath, "Contents", "Resources", MAC_BREAK_REMINDER_UTF8_MARKER), "");
 		if (!(await runCommand("plutil", [
 			"-insert",
 			"CFBundleIdentifier",
@@ -400,8 +405,8 @@ async function sendBreakReminderDesktopNotification(title: string, body: string)
 	if (!(await ensureMacBreakReminderApp(appPath))) return false;
 	return runCommand(path.join(appPath, "Contents", "MacOS", "applet"), [], {
 		...process.env,
-		PI_BREAK_REMINDER_TITLE: title,
-		PI_BREAK_REMINDER_BODY: body,
+		PI_BREAK_REMINDER_TITLE: Buffer.from(title).toString("base64"),
+		PI_BREAK_REMINDER_BODY: Buffer.from(body).toString("base64"),
 	});
 }
 
