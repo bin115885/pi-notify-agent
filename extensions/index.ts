@@ -1,5 +1,5 @@
 import { execFile, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -16,6 +16,7 @@ const BREAK_REMINDER_HANDSHAKE_MS = 1000;
 const NOTIFY_LOCAL_STATE_VERSION = 1;
 const MAC_BREAK_REMINDER_BUNDLE_ID = "com.bin115885.pi-notify-agent.break-reminder";
 const MAC_BREAK_REMINDER_APP_NAME = "Pi Break Reminder.app";
+const MAC_BREAK_REMINDER_ICON = "/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/Clock.icns";
 const LINUX_SOUND_FILES = [
 	"/usr/share/sounds/freedesktop/stereo/complete.oga",
 	"/usr/share/sounds/freedesktop/stereo/message.oga",
@@ -351,7 +352,7 @@ const macBreakReminderAppPath = (): string =>
 	path.join(homedir(), "Library", "Application Support", "pi-notify-agent", MAC_BREAK_REMINDER_APP_NAME);
 
 export async function ensureMacBreakReminderApp(appPath = macBreakReminderAppPath()): Promise<boolean> {
-	if (existsSync(appPath)) return true;
+	if (existsSync(path.join(appPath, "Contents", "Resources", "Clock.icns"))) return true;
 
 	mkdirSync(path.dirname(appPath), { recursive: true });
 	const temporaryPath = path.join(path.dirname(appPath), `.Pi Break Reminder.${process.pid}.app`);
@@ -368,6 +369,7 @@ export async function ensureMacBreakReminderApp(appPath = macBreakReminderAppPat
 			"-e",
 			"display notification notificationBody with title notificationTitle",
 		]))) return false;
+		copyFileSync(MAC_BREAK_REMINDER_ICON, path.join(temporaryPath, "Contents", "Resources", "Clock.icns"));
 		if (!(await runCommand("plutil", [
 			"-insert",
 			"CFBundleIdentifier",
@@ -375,7 +377,15 @@ export async function ensureMacBreakReminderApp(appPath = macBreakReminderAppPat
 			MAC_BREAK_REMINDER_BUNDLE_ID,
 			path.join(temporaryPath, "Contents", "Info.plist"),
 		]))) return false;
+		if (!(await runCommand("plutil", [
+			"-replace",
+			"CFBundleIconFile",
+			"-string",
+			"Clock.icns",
+			path.join(temporaryPath, "Contents", "Info.plist"),
+		]))) return false;
 		if (!(await runCommand("codesign", ["--force", "--sign", "-", temporaryPath]))) return false;
+		rmSync(appPath, { recursive: true, force: true });
 		renameSync(temporaryPath, appPath);
 		return true;
 	} finally {

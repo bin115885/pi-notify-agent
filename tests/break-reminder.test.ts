@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -56,6 +56,11 @@ test("macOS 休息提醒使用独立通知应用", { skip: process.platform !== 
 	});
 	assert.equal(bundleId.status, 0, bundleId.stderr);
 	assert.equal(bundleId.stdout.trim(), "com.bin115885.pi-notify-agent.break-reminder");
+	const iconName = spawnSync("plutil", ["-extract", "CFBundleIconFile", "raw", path.join(appPath, "Contents", "Info.plist")], {
+		encoding: "utf8",
+	});
+	assert.equal(iconName.stdout.trim(), "Clock.icns");
+	assert.equal(existsSync(path.join(appPath, "Contents", "Resources", "Clock.icns")), true);
 	assert.equal(spawnSync("codesign", ["--verify", appPath]).status, 0);
 });
 
