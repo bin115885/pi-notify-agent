@@ -12,13 +12,17 @@ When a pi run takes longer than a configurable threshold, this package notifies 
 ## Features
 
 - **Windows:** native toast + system beep
-- **macOS:** native notification via `osascript` + system beep
+- **macOS:** agent outcomes via `osascript`; break reminders use a separate signed `Pi Break Reminder` app
 - **Linux:** `notify-send` + sound fallback (`canberra-gtk-play` / `paplay` when available)
 - **Terminal fallback:** Kitty `OSC 99`, otherwise `OSC 777`, plus terminal bell when needed
 - **Attention mode:** emits `BEL` so supporting terminals can flash taskbar, tab, dock, or urgency state
 - **Noise reduction:** default threshold is **3000ms**
 - **pi commands:** `/notify-test`, `/notify-test error`, `/notify-status`
 - **CLI flags:** configure threshold and on/off behavior without editing code
+
+### macOS notification styles
+
+After the first break reminder, open **System Settings → Notifications → Pi Break Reminder** and select **Alerts**. Keep the AppleScript notification sender on **Banners** so agent completion notifications still disappear automatically.
 
 ## Install
 

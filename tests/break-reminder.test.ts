@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+	ensureMacBreakReminderApp,
 	getNextBreakReminderTime,
 	isBreakReminderTime,
 	readNotifyLocalState,
@@ -41,6 +43,20 @@ test("计算下一次休息提醒而不轮询", () => {
 	assert.deepEqual(getNextBreakReminderTime(new Date(2026, 2, 2, 10, 0, 1)), new Date(2026, 2, 2, 11, 0));
 	assert.deepEqual(getNextBreakReminderTime(new Date(2026, 2, 6, 18, 30)), new Date(2026, 2, 9, 10, 0));
 	assert.deepEqual(getNextBreakReminderTime(new Date(2026, 2, 6, 18, 30), true), new Date(2026, 2, 7, 10, 0));
+});
+
+test("macOS 休息提醒使用独立通知应用", { skip: process.platform !== "darwin" }, async (t) => {
+	const dir = mkdtempSync(path.join(tmpdir(), "pi-break-reminder-app-"));
+	const appPath = path.join(dir, "Pi Break Reminder.app");
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+	assert.equal(await ensureMacBreakReminderApp(appPath), true);
+	const bundleId = spawnSync("plutil", ["-extract", "CFBundleIdentifier", "raw", path.join(appPath, "Contents", "Info.plist")], {
+		encoding: "utf8",
+	});
+	assert.equal(bundleId.status, 0, bundleId.stderr);
+	assert.equal(bundleId.stdout.trim(), "com.bin115885.pi-notify-agent.break-reminder");
+	assert.equal(spawnSync("codesign", ["--verify", appPath]).status, 0);
 });
 
 test("统一持久化本地通知状态", (t) => {

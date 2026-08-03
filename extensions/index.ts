@@ -14,6 +14,8 @@ const BREAK_REMINDER_PORT = 54_273;
 const BREAK_REMINDER_PROTOCOL = "pi-notify-agent/break-reminder/v1\n";
 const BREAK_REMINDER_HANDSHAKE_MS = 1000;
 const NOTIFY_LOCAL_STATE_VERSION = 1;
+const MAC_BREAK_REMINDER_BUNDLE_ID = "com.bin115885.pi-notify-agent.break-reminder";
+const MAC_BREAK_REMINDER_APP_NAME = "Pi Break Reminder.app";
 const LINUX_SOUND_FILES = [
 	"/usr/share/sounds/freedesktop/stereo/complete.oga",
 	"/usr/share/sounds/freedesktop/stereo/message.oga",
@@ -59,9 +61,9 @@ function runDetached(command: string, args: string[]): void {
 	});
 }
 
-function runCommand(command: string, args: string[]): Promise<boolean> {
+function runCommand(command: string, args: string[], env?: NodeJS.ProcessEnv): Promise<boolean> {
 	return new Promise((resolve) => {
-		execFile(command, args, { windowsHide: true }, (error) => {
+		execFile(command, args, { windowsHide: true, env }, (error) => {
 			if (error) console.error(`[pi-notify-agent] ${command}: ${error.message}`);
 			resolve(!error);
 		});
@@ -345,6 +347,54 @@ function sendTerminalNotification(title: string, body: string): void {
 	notifyOsc777(title, body);
 }
 
+const macBreakReminderAppPath = (): string =>
+	path.join(homedir(), "Library", "Application Support", "pi-notify-agent", MAC_BREAK_REMINDER_APP_NAME);
+
+export async function ensureMacBreakReminderApp(appPath = macBreakReminderAppPath()): Promise<boolean> {
+	if (existsSync(appPath)) return true;
+
+	mkdirSync(path.dirname(appPath), { recursive: true });
+	const temporaryPath = path.join(path.dirname(appPath), `.Pi Break Reminder.${process.pid}.app`);
+	rmSync(temporaryPath, { recursive: true, force: true });
+
+	try {
+		if (!(await runCommand("osacompile", [
+			"-o",
+			temporaryPath,
+			"-e",
+			'set notificationTitle to system attribute "PI_BREAK_REMINDER_TITLE"',
+			"-e",
+			'set notificationBody to system attribute "PI_BREAK_REMINDER_BODY"',
+			"-e",
+			"display notification notificationBody with title notificationTitle",
+		]))) return false;
+		if (!(await runCommand("plutil", [
+			"-insert",
+			"CFBundleIdentifier",
+			"-string",
+			MAC_BREAK_REMINDER_BUNDLE_ID,
+			path.join(temporaryPath, "Contents", "Info.plist"),
+		]))) return false;
+		if (!(await runCommand("codesign", ["--force", "--sign", "-", temporaryPath]))) return false;
+		renameSync(temporaryPath, appPath);
+		return true;
+	} finally {
+		rmSync(temporaryPath, { recursive: true, force: true });
+	}
+}
+
+async function sendBreakReminderDesktopNotification(title: string, body: string): Promise<boolean> {
+	if (!isMac()) return sendDesktopNotification(title, body);
+
+	const appPath = macBreakReminderAppPath();
+	if (!(await ensureMacBreakReminderApp(appPath))) return false;
+	return runCommand(path.join(appPath, "Contents", "MacOS", "applet"), [], {
+		...process.env,
+		PI_BREAK_REMINDER_TITLE: title,
+		PI_BREAK_REMINDER_BODY: body,
+	});
+}
+
 async function sendDesktopNotification(title: string, body: string): Promise<boolean> {
 	if (canUseWindowsToast()) {
 		return runCommand("powershell.exe", ["-NoProfile", "-Command", windowsToastScript(title, body)]);
@@ -464,8 +514,9 @@ async function deliverNotification(
 	body: string,
 	soundEnabled: boolean,
 	attentionEnabled: boolean,
+	sendNotification = sendDesktopNotification,
 ): Promise<void> {
-	if (!(await sendDesktopNotification(title, body))) {
+	if (!(await sendNotification(title, body))) {
 		sendTerminalNotification(title, body);
 	}
 
@@ -540,6 +591,7 @@ async function notifyBreak(pi: ExtensionAPI, ctx: ExtensionContext): Promise<voi
 		`${getProjectLabel(ctx, pi)} • 已连续工作一小时，起来活动一下。`,
 		parseBoolean(pi.getFlag("notify-sound"), true),
 		parseBoolean(pi.getFlag("notify-attention"), true),
+		sendBreakReminderDesktopNotification,
 	);
 }
 
